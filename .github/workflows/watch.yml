@@ -1,0 +1,69 @@
+name: Мониторинг портфеля → Telegram
+
+on:
+  schedule:
+    # Раз в 15 минут, только в будни и только в часы торгов Мосбиржи
+    # (07:00–19:00 UTC = 10:00–22:00 МСК). Это ~280 запусков в месяц вместо
+    # 8600 у варианта «каждые 5 минут круглосуточно» — при том же результате:
+    # сделка, совершённая в течение дня, всё равно прилетит в тот же день.
+    #
+    # Нужны ровно 5 минут? Замените строку ниже на:
+    #     - cron: '*/5 7-18 * * 1-5'
+    # и добавьте timeout-minutes: 8 (Chromium успевает стартовать, но впритык).
+    - cron: '*/15 7-18 * * 1-5'
+  workflow_dispatch: {}        # кнопка "Run workflow" — чтобы testировать вручную
+
+# На ПУБЛИЧНОМ репозитории GitHub Actions бесплатны и безлимитны по времени.
+# На приватном — 2000 минут/мес, и этого не хватит. Поэтому репозиторий публичный.
+permissions:
+  contents: write        # нужно, чтобы закоммитить обратно state.json
+                         # (плюс выставьте Read-and-write в Settings → Actions, см. инструкцию)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установка библиотек
+        run: |
+          pip install --quiet requests beautifulsoup4 lxml playwright
+          playwright install --with-deps chromium
+
+      - name: Проверка портфеля
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          # html = открываем страницу в headless-Chromium и читаем таблицу сделок.
+          # Это единственный вариант, который работает «из коробки», без настройки API.
+          # Когда получите api_template (python watcher.py --from-curl ...),
+          # меняйте на api — будет заметно легче и быстрее.
+          DATA_SOURCE: html
+          USE_BROWSER: 1
+        run: python run_once.py
+
+      - name: Сохранить состояние (только если появились новые сделки)
+        if: always()
+        run: |
+          if [ -f no_change ]; then
+            echo "Изменений нет — коммит не нужен."
+            exit 0
+          fi
+          if [ ! -f state.json ]; then
+            echo "state.json не появился (пропуск или ошибка) — ничего не коммитим."
+            exit 0
+          fi
+          git config user.name  "portfolio-bot"
+          git config user.email "portfolio-bot@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "Содержимое совпало — коммит не нужен."
+            exit 0
+          fi
+          git commit -m "state: $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push
